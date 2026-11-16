@@ -2250,6 +2250,7 @@ próprias licenças (acima).
 #include <pdh.h>
 #include <psapi.h>
 #include <physicalmonitorenumerationapi.h>
+#include <powrprof.h>
 #include <propsys.h>
 #include <wbemidl.h>
 #include <wincodec.h>
@@ -2270,6 +2271,7 @@ próprias licenças (acima).
 #include <uiautomation.h>
 #include <wuapi.h>
 #include <dispatcherqueue.h>
+
 
 #include <algorithm>
 #include <array>
@@ -2962,6 +2964,7 @@ struct {
     bool usageCpu;
     bool usageRam;
     bool usageVram;
+    bool usagePower;
     // A button muting the microphone, on the pill.
     bool islandMicrophone;
     // Public holidays in the calendar (goes online, see Holiday).
@@ -15871,6 +15874,7 @@ enum class IslandItem {
     // event (two short lines each, see kStackedFont), and the Recycle Bin
     // (see RecycleBinPanel).
     NetSpeed,
+    UsagePower,
     WorldClock,
     Countdown,
     RecycleBin,
@@ -55663,6 +55667,7 @@ enum class IslandPref {
     UsageCpu,
     UsageRam,
     UsageVram,
+    UsagePower,
     Microphone,
     Holidays,
     Notes,
@@ -55990,6 +55995,8 @@ const IslandPrefInfo kIslandPrefs[] = {
      L"Uso da memória (RAM)"},
     {IslandPref::UsageVram, L"usageVram", 0xEEA1, L"Video memory in use (VRAM)",
      L"Memória de vídeo em uso (VRAM)"},
+    {IslandPref::UsagePower, L"usagePower", kGlyphPower,
+     L"Battery power draw or charge rate", L"Consumo ou carga da bateria"},
     {IslandPref::Microphone, L"islandMicrophone", 0xE720,
      L"Microphone button (mute)", L"Botão do microfone (silenciar)"},
     {IslandPref::Holidays, L"calendarHolidays", 0xE787,
@@ -56835,7 +56842,8 @@ const PillGroupInfo kPillGroupInfo[kPillGroups] = {
 // a switch for each).
 bool AnyUsageShown() {
     return g_settings.usageCpu || g_settings.usageRam ||
-           g_settings.usageVram || g_settings.usageGpu ||
+           g_settings.usageVram || g_settings.usagePower ||
+           g_settings.usageGpu ||
            g_settings.usageGpuTemp || g_settings.usageCpuTemp;
 }
 
@@ -65187,6 +65195,14 @@ constexpr UINT WM_APP_USAGE_PANEL = WM_APP + 107;
 constexpr double kUsageChangeSeconds = 0.8;
 // How many measures the panel's graphs keep.
 constexpr size_t kUsageHistory = 60;
+constexpr size_t kBatteryPowerHistory = 300;
+constexpr double kBatteryPercentHistorySeconds = 12 * 60 * 60;
+constexpr double kBatteryPercentSampleSeconds = 60;
+
+struct BatteryPercentSample {
+    double measuredAt;
+    float percent;
+};
 
 struct UsageDetails {
     // Percent.
@@ -65214,9 +65230,18 @@ struct UsageDetails {
     int gpuTemperature = -1;
     int gpuFan = -1;
     int gpuPower = -1;
+    int batteryPowerWatts = 0;
+    bool batteryPowerAvailable = false;
+    bool batteryCharging = false;
+    int batteryPercent = 0;
+    bool batteryPercentAvailable = false;
+    unsigned long long batteryTimeSeconds = 0;
+    bool batteryTimeAvailable = false;
     // The last measures (oldest first), in percent (the temperature in
     // degrees), and when the last one came.
     std::vector<float> history[4];
+    std::vector<float> batteryPowerHistory;
+    std::vector<BatteryPercentSample> batteryPercentHistory;
     double measuredAt = 0;
 };
 SRWLOCK g_usageLock = SRWLOCK_INIT;
@@ -65226,6 +65251,18 @@ std::atomic<bool> g_usageFast{false};
 std::atomic<bool> g_usageGpuWanted{false};
 // The processor's temperature too (only while its item is on).
 std::atomic<bool> g_usageCpuTempWanted{false};
+std::atomic<bool> g_usagePowerWanted{false};
+
+struct BatteryUsageReading {
+    bool batteryAvailable = false;
+    int batteryPercent = 0;
+    bool powerAvailable = false;
+    int powerWatts = 0;
+    bool charging = false;
+    bool timeAvailable = false;
+    unsigned long long timeSeconds = 0;
+};
+BatteryUsageReading ReadBatteryUsage();
 
 UsageDetails GetUsage() {
     AcquireSRWLockShared(&g_usageLock);
@@ -65555,6 +65592,7 @@ DWORD WINAPI UsageThreadProc(LPVOID parameter) {
     PdhQuery thermalQuery;
     int thermalMisses = 0;
     UsageDetails usage;
+    double lastBatteryPercentSampleAt = 0;
     CountCores(&usage);
     std::wstring gpuInstance;
     using GetPerformanceInfo_t = BOOL(WINAPI*)(PPERFORMANCE_INFORMATION, DWORD);
@@ -65685,6 +65723,41 @@ DWORD WINAPI UsageThreadProc(LPVOID parameter) {
             usage.cpuTemperature = -1;
             thermalMisses = 0;
         }
+        if (g_usagePowerWanted) {
+            const BatteryUsageReading battery = ReadBatteryUsage();
+            const double batteryMeasuredAt = NowSeconds();
+            usage.batteryPercentAvailable = battery.batteryAvailable;
+            usage.batteryPercent = battery.batteryPercent;
+            usage.batteryPowerAvailable = battery.powerAvailable;
+            usage.batteryPowerWatts = battery.powerWatts;
+            usage.batteryCharging = battery.charging;
+            usage.batteryTimeAvailable = battery.timeAvailable;
+            usage.batteryTimeSeconds = battery.timeSeconds;
+            if (battery.powerAvailable) {
+                usage.batteryPowerHistory.push_back(
+                    (float)battery.powerWatts);
+                if (usage.batteryPowerHistory.size() > kBatteryPowerHistory) {
+                    usage.batteryPowerHistory.erase(
+                        usage.batteryPowerHistory.begin());
+                }
+            } else {
+                usage.batteryPowerHistory.clear();
+            }
+            if (battery.batteryAvailable &&
+                (!lastBatteryPercentSampleAt ||
+                 batteryMeasuredAt - lastBatteryPercentSampleAt >=
+                     kBatteryPercentSampleSeconds)) {
+                usage.batteryPercentHistory.push_back(
+                    {batteryMeasuredAt, (float)battery.batteryPercent});
+                lastBatteryPercentSampleAt = batteryMeasuredAt;
+            }
+            while (!usage.batteryPercentHistory.empty() &&
+                   usage.batteryPercentHistory.front().measuredAt <
+                       batteryMeasuredAt - kBatteryPercentHistorySeconds) {
+                usage.batteryPercentHistory.erase(
+                    usage.batteryPercentHistory.begin());
+            }
+        }
         keep(usage.history[0], (float)std::max(usage.cpu, 0));
         keep(usage.history[1], (float)std::max(usage.ram, 0));
         if (usage.gpu >= 0) {
@@ -65714,7 +65787,7 @@ std::wstring FormatRate(double bytes);
 
 class UsagePanel : public Panel {
    public:
-    enum class Kind { Cpu, Ram, Gpu, Net };
+    enum class Kind { Cpu, Ram, Gpu, Net, Power };
     void SetKind(Kind kind) {
         m_kind = kind;
         if (IsOpen()) {
@@ -65843,7 +65916,7 @@ class UsagePanel : public Panel {
         std::wstring value;
     };
     std::vector<Tile> Tiles() const;
-    static constexpr int kTabs = 4;
+    static constexpr int kTabs = 5;
     static constexpr int kTaskManagerHit = kTabs;
 
     void TellOwner() {
@@ -65864,7 +65937,7 @@ class UsagePanel : public Panel {
         m_graphs.clear();
         const float graph = std::round(62 * s);
         const int graphs =
-            m_kind == Kind::Net ||
+            m_kind == Kind::Net || m_kind == Kind::Power ||
                     (m_kind == Kind::Gpu && !m_usage.history[3].empty())
                 ? 2
                 : 1;
@@ -65903,6 +65976,15 @@ class UsagePanel : public Panel {
                    float top,
                    D2D1_COLOR_F color,
                    PCWSTR label);
+    void DrawPowerGraph(ID2D1RenderTarget* target,
+                        ID2D1SolidColorBrush* brush,
+                        const D2D1_RECT_F& rect,
+                        const std::vector<float>& values);
+    void DrawBatteryPercentGraph(
+        ID2D1RenderTarget* target,
+        ID2D1SolidColorBrush* brush,
+        const D2D1_RECT_F& rect,
+        const std::vector<BatteryPercentSample>& values);
 
     Kind m_kind = Kind::Cpu;
     int m_hover = -1;
@@ -65945,6 +66027,84 @@ std::wstring NetRateText(const std::vector<float>& history, bool peak) {
     const float rate = peak ? *std::max_element(history.begin(), history.end())
                             : history.back();
     return FormatRate(rate) + L"B/s";
+}
+
+// Battery power draw or charge rate, as reported by Windows in milliwatts.
+HMODULE Powrprof();
+BatteryUsageReading ReadBatteryUsage() {
+    BatteryUsageReading reading;
+    SYSTEM_POWER_STATUS status{};
+    if (!GetSystemPowerStatus(&status) || (status.BatteryFlag & 128) ||
+        status.BatteryFlag == 255 || status.BatteryLifePercent > 100) {
+        return reading;
+    }
+    reading.batteryAvailable = true;
+    reading.batteryPercent = status.BatteryLifePercent;
+
+    SYSTEM_BATTERY_STATE state{};
+    HMODULE powrprof = Powrprof();
+    using CallNtPowerInformation_t = LONG(WINAPI*)(
+        POWER_INFORMATION_LEVEL, PVOID, ULONG, PVOID, ULONG);
+    auto callNtPowerInformation = powrprof
+                                     ? (CallNtPowerInformation_t)GetProcAddress(
+                                           powrprof, "CallNtPowerInformation")
+                                     : nullptr;
+    if (!callNtPowerInformation ||
+        callNtPowerInformation(SystemBatteryState, nullptr, 0, &state,
+                               sizeof(state)) != 0 ||
+        state.MaxCapacity <= 0) {
+        if (status.ACLineStatus != 1 &&
+            status.BatteryLifeTime != (DWORD)-1) {
+            reading.timeAvailable = true;
+            reading.timeSeconds = status.BatteryLifeTime;
+        }
+        return reading;
+    }
+
+    const LONG milliWatts = state.Rate;
+    reading.charging = status.ACLineStatus == 1 &&
+                       status.BatteryLifePercent < 100;
+    if (milliWatts != LONG_MIN) {
+        reading.powerAvailable = true;
+        reading.powerWatts = (int)((milliWatts +
+                                    (milliWatts >= 0 ? 500 : -500)) /
+                                   1000);
+    }
+
+    if (status.ACLineStatus == 1) {
+        if (status.BatteryLifePercent >= 100) {
+            reading.timeAvailable = true;
+        } else if (state.Rate > 0 &&
+                   state.RemainingCapacity < state.MaxCapacity) {
+            reading.timeAvailable = true;
+            reading.timeSeconds =
+                (ULONGLONG)(state.MaxCapacity - state.RemainingCapacity) *
+                3600 / (ULONG)state.Rate;
+        }
+    } else if (status.BatteryLifeTime != (DWORD)-1) {
+        reading.timeAvailable = true;
+        reading.timeSeconds = status.BatteryLifeTime;
+    }
+    return reading;
+}
+
+std::wstring BatteryPowerText(int watts, bool available) {
+    if (!available) {
+        return L"–";
+    }
+    WCHAR text[24];
+    swprintf_s(text, L"%+dW", watts);
+    return text;
+}
+
+std::wstring BatteryTimeText(const UsageDetails& usage) {
+    if (!usage.batteryTimeAvailable) {
+        return L"–";
+    }
+    const unsigned long long minutes = usage.batteryTimeSeconds / 60;
+    WCHAR text[32];
+    swprintf_s(text, L"%llu:%02llu", minutes / 60, minutes % 60);
+    return text;
 }
 
 // Defined further down.
@@ -66033,6 +66193,16 @@ std::vector<UsagePanel::Tile> UsagePanel::Tiles() const {
                 {Tr(L"Upload peak (1 min)", L"Pico enviando (1 min)"),
                  NetRateText(g_netUpHistory, true)},
             };
+        case Kind::Power:
+            return {
+                {Tr(L"Battery power", L"Energia da bateria"),
+                 BatteryPowerText(u.batteryPowerWatts,
+                                  u.batteryPowerAvailable)},
+                {u.batteryCharging
+                     ? Tr(L"Time to full", L"Tempo até carga completa")
+                     : Tr(L"Time to lapse", L"Tempo até descarregar"),
+                 BatteryTimeText(u)},
+            };
     }
     return {};
 }
@@ -66053,7 +66223,8 @@ void UsagePanel::DrawTabs(ID2D1RenderTarget* target,
     brush->SetColor(Fg(0.2f));
     GlassFill(target, {lit, litRadius, litRadius}, brush);
     const PCWSTR names[kTabs] = {L"CPU", L"RAM", L"VRAM",
-                                 Tr(L"Network", L"Rede")};
+                                 Tr(L"Network", L"Rede"),
+                                 Tr(L"Power", L"Energia")};
     for (int i = 0; i < kTabs; i++) {
         const float hover = Hover(HoverKey(6650, i), m_hover == i);
         brush->SetColor(Fg(i == (int)m_kind ? 0.95f : 0.6f + 0.2f * hover));
@@ -66133,6 +66304,182 @@ void UsagePanel::DrawGraph(ID2D1RenderTarget* target,
     target->PopAxisAlignedClip();
 }
 
+void UsagePanel::DrawPowerGraph(ID2D1RenderTarget* target,
+                                ID2D1SolidColorBrush* brush,
+                                const D2D1_RECT_F& rect,
+                                const std::vector<float>& values) {
+    const float s = m_scale;
+    brush->SetColor(Fg(0.5f));
+    const PCWSTR label = Tr(L"Charging / discharging (W)",
+                            L"Carregando / descarregando (W)");
+    target->DrawText(label, (UINT32)wcslen(label), m_labelFormat.get(),
+                     {rect.left, rect.top - std::round(17 * s), rect.right,
+                      rect.top},
+                     brush);
+    brush->SetColor(Fg(0.035f));
+    target->FillRectangle(rect, brush);
+
+    float peak = 1;
+    for (float value : values) {
+        peak = std::max(peak, std::fabs(value));
+    }
+    peak *= 1.1f;
+    const float middle = (rect.top + rect.bottom) / 2;
+    brush->SetColor(Fg(0.06f));
+    for (int i : {-2, -1, 1, 2}) {
+        const float y = middle - (rect.bottom - rect.top) * i / 6;
+        target->DrawLine({rect.left, y}, {rect.right, y}, brush, 1);
+    }
+    brush->SetColor(Fg(0.22f));
+    target->DrawLine({rect.left, middle}, {rect.right, middle}, brush,
+                     std::max(1.0f, 1.2f * s));
+
+    if (values.size() < 2) {
+        return;
+    }
+    auto point = [&](size_t i) {
+        const float x = rect.right -
+                        (values.size() - 1 - i) * (rect.right - rect.left) /
+                            (kBatteryPowerHistory - 1);
+        const float y = middle - values[i] / peak * (rect.bottom - rect.top) / 2;
+        return D2D1::Point2F(x, y);
+    };
+    const D2D1_COLOR_F charging = D2D1::ColorF(0.24f, 0.78f, 0.42f, 1);
+    const D2D1_COLOR_F discharging = D2D1::ColorF(1.0f, 0.38f, 0.32f, 1);
+    for (size_t i = 1; i < values.size(); i++) {
+        const D2D1_POINT_2F a = point(i - 1);
+        const D2D1_POINT_2F b = point(i);
+        if ((values[i - 1] < 0) != (values[i] < 0) &&
+            values[i - 1] != values[i]) {
+            const float t = values[i - 1] /
+                            (values[i - 1] - values[i]);
+            const D2D1_POINT_2F zero{a.x + (b.x - a.x) * t, middle};
+            brush->SetColor(values[i - 1] >= 0 ? charging : discharging);
+            target->DrawLine(a, zero, brush, std::max(1.0f, 1.5f * s));
+            brush->SetColor(values[i] >= 0 ? charging : discharging);
+            target->DrawLine(zero, b, brush, std::max(1.0f, 1.5f * s));
+        } else {
+            brush->SetColor(values[i] >= 0 ? charging : discharging);
+            target->DrawLine(a, b, brush, std::max(1.0f, 1.5f * s));
+        }
+    }
+}
+
+void UsagePanel::DrawBatteryPercentGraph(
+    ID2D1RenderTarget* target,
+    ID2D1SolidColorBrush* brush,
+    const D2D1_RECT_F& rect,
+    const std::vector<BatteryPercentSample>& values) {
+    const float s = m_scale;
+    brush->SetColor(Fg(0.5f));
+    const PCWSTR label = Tr(L"Battery percentage (12 hours)",
+                            L"Bateria (12 horas)");
+    target->DrawText(label, (UINT32)wcslen(label), m_labelFormat.get(),
+                     {rect.left, rect.top - std::round(17 * s), rect.right,
+                      rect.top},
+                     brush);
+    brush->SetColor(Fg(0.035f));
+    target->FillRectangle(rect, brush);
+
+    for (int percent : {0, 25, 50, 75, 100}) {
+        const float y = rect.bottom - (rect.bottom - rect.top) * percent / 100;
+        brush->SetColor(Fg(percent == 0 ? 0.12f : 0.06f));
+        target->DrawLine({rect.left, y}, {rect.right, y}, brush,
+                         percent == 0 ? std::max(1.0f, s) : 1);
+    }
+    if (values.size() < 2) {
+        return;
+    }
+
+    const double now = NowSeconds();
+    const float width = rect.right - rect.left;
+    auto point = [&](const BatteryPercentSample& sample) {
+        const float x = rect.right -
+                        (float)((now - sample.measuredAt) /
+                                kBatteryPercentHistorySeconds) * width;
+        const float y = rect.bottom -
+                        (rect.bottom - rect.top) *
+                            std::clamp(sample.percent, 0.0f, 100.0f) / 100;
+        return D2D1::Point2F(x, y);
+    };
+    winrt::com_ptr<ID2D1Factory> factory;
+    target->GetFactory(factory.put());
+    winrt::com_ptr<ID2D1PathGeometry> upLine;
+    winrt::com_ptr<ID2D1PathGeometry> downLine;
+    winrt::com_ptr<ID2D1PathGeometry> upArea;
+    winrt::com_ptr<ID2D1PathGeometry> downArea;
+    winrt::com_ptr<ID2D1GeometrySink> upLineSink;
+    winrt::com_ptr<ID2D1GeometrySink> downLineSink;
+    winrt::com_ptr<ID2D1GeometrySink> upAreaSink;
+    winrt::com_ptr<ID2D1GeometrySink> downAreaSink;
+    if (FAILED(factory->CreatePathGeometry(upLine.put())) ||
+        FAILED(factory->CreatePathGeometry(downLine.put())) ||
+        FAILED(factory->CreatePathGeometry(upArea.put())) ||
+        FAILED(factory->CreatePathGeometry(downArea.put())) ||
+        FAILED(upLine->Open(upLineSink.put())) ||
+        FAILED(downLine->Open(downLineSink.put())) ||
+        FAILED(upArea->Open(upAreaSink.put())) ||
+        FAILED(downArea->Open(downAreaSink.put()))) {
+        return;
+    }
+
+    const float baseline = rect.bottom;
+    bool runOpen = false;
+    bool runRising = false;
+    target->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_ALIASED);
+    for (size_t i = 1; i < values.size(); i++) {
+        if (values[i].measuredAt - values[i - 1].measuredAt >
+            kBatteryPercentSampleSeconds * 2) {
+            if (runOpen) {
+                (runRising ? upLineSink : downLineSink)
+                    ->EndFigure(D2D1_FIGURE_END_OPEN);
+                runOpen = false;
+            }
+            continue;
+        }
+        const D2D1_POINT_2F a = point(values[i - 1]);
+        const D2D1_POINT_2F b = point(values[i]);
+        const bool rising = values[i].percent >= values[i - 1].percent;
+        if (!runOpen || rising != runRising) {
+            if (runOpen) {
+                (runRising ? upLineSink : downLineSink)
+                    ->EndFigure(D2D1_FIGURE_END_OPEN);
+            }
+            (rising ? upLineSink : downLineSink)
+                ->BeginFigure(a, D2D1_FIGURE_BEGIN_HOLLOW);
+            runOpen = true;
+            runRising = rising;
+        }
+        (rising ? upLineSink : downLineSink)->AddLine(b);
+
+        auto* areaSink = rising ? upAreaSink.get() : downAreaSink.get();
+        areaSink->BeginFigure({a.x, baseline}, D2D1_FIGURE_BEGIN_FILLED);
+        areaSink->AddLine(a);
+        areaSink->AddLine(b);
+        areaSink->AddLine({b.x, baseline});
+        areaSink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    }
+    if (runOpen) {
+        (runRising ? upLineSink : downLineSink)
+            ->EndFigure(D2D1_FIGURE_END_OPEN);
+    }
+    upLineSink->Close();
+    downLineSink->Close();
+    upAreaSink->Close();
+    downAreaSink->Close();
+    const D2D1_COLOR_F risingColor = D2D1::ColorF(0.20f, 0.55f, 1.0f, 1);
+    const D2D1_COLOR_F fallingColor = D2D1::ColorF(0.95f, 0.24f, 0.28f, 1);
+    brush->SetColor({risingColor.r, risingColor.g, risingColor.b, 0.16f});
+    target->FillGeometry(upArea.get(), brush);
+    brush->SetColor({fallingColor.r, fallingColor.g, fallingColor.b, 0.16f});
+    target->FillGeometry(downArea.get(), brush);
+    brush->SetColor(risingColor);
+    target->DrawGeometry(upLine.get(), brush, std::max(1.0f, 1.5f * s));
+    brush->SetColor(fallingColor);
+    target->DrawGeometry(downLine.get(), brush, std::max(1.0f, 1.5f * s));
+    target->PopAxisAlignedClip();
+}
+
 void UsagePanel::Draw(ID2D1RenderTarget* target, ID2D1SolidColorBrush* brush) {
     if (!m_titleFormat || !m_labelFormat || !m_valueFormat || !m_tabFormat) {
         return;
@@ -66141,6 +66488,8 @@ void UsagePanel::Draw(ID2D1RenderTarget* target, ID2D1SolidColorBrush* brush) {
     DrawTabs(target, brush);
     std::wstring title = m_kind == Kind::Cpu ? Tr(L"Processor", L"Processador")
                          : m_kind == Kind::Ram ? Tr(L"Memory", L"Memória")
+                         : m_kind == Kind::Power
+                             ? Tr(L"Power", L"Energia")
                          : m_kind == Kind::Net
                              ? Tr(L"Network", L"Rede")
                              : (m_usage.gpuName.empty() ? std::wstring(L"GPU")
@@ -66149,7 +66498,13 @@ void UsagePanel::Draw(ID2D1RenderTarget* target, ID2D1SolidColorBrush* brush) {
     target->DrawText(title.c_str(), (UINT32)title.size(), m_titleFormat.get(),
                      m_title, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
     const D2D1_COLOR_F blue = D2D1::ColorF(0.35f, 0.62f, 1.0f, 1);
-    if (m_kind == Kind::Net) {
+    if (m_kind == Kind::Power && !m_graphs.empty()) {
+        DrawPowerGraph(target, brush, m_graphs[0], m_usage.batteryPowerHistory);
+        if (m_graphs.size() > 1) {
+            DrawBatteryPercentGraph(target, brush, m_graphs[1],
+                                    m_usage.batteryPercentHistory);
+        }
+    } else if (m_kind == Kind::Net) {
         // Each one up to its own peak (not less than 64 KB/s: a line of a few
         // bytes shouldn't look like a full graph).
         auto top = [](const std::vector<float>& history) {
@@ -100785,6 +101140,9 @@ std::wstring ControlPanel::SettingDescription(const SettingEntry& entry) const {
         {SettingKind::Pref, (int)IslandPref::NetSpeed,
          L"Shows the current upload and download speed",
          L"Mostra a velocidade atual de envio e recebimento"},
+        {SettingKind::Pref, (int)IslandPref::UsagePower,
+         L"Shows battery power draw or charge rate in watts",
+         L"Mostra o consumo ou a carga da bateria em watts"},
         {SettingKind::Pref, (int)IslandPref::Timer,
          L"Adds a timer, a stopwatch and a Pomodoro to the pill",
          L"Adiciona timer, cronômetro e Pomodoro à pílula"},
@@ -103023,6 +103381,7 @@ void ControlPanel::LayoutSettings() {
             {(int)SettingKind::Pref, (int)IslandPref::UsageGpuTemp,
              kSectionTools},
             {(int)SettingKind::Pref, (int)IslandPref::NetSpeed, kSectionTools},
+            {(int)SettingKind::Pref, (int)IslandPref::UsagePower, kSectionTools},
             {(int)SettingKind::Pref, (int)IslandPref::Timer, kSectionTools},
             {(int)SettingKind::Pref, (int)IslandPref::TimerFill,
              kSectionTools, 1},
@@ -120266,6 +120625,8 @@ int GetIslandPref(IslandPref pref) {
             return g_settings.usageRam;
         case IslandPref::UsageVram:
             return g_settings.usageVram;
+        case IslandPref::UsagePower:
+            return g_settings.usagePower;
         case IslandPref::Microphone:
             return g_settings.islandMicrophone;
         case IslandPref::Holidays:
@@ -121468,6 +121829,9 @@ void SetIslandPref(IslandPref pref, int value) {
         case IslandPref::UsageVram:
             g_settings.usageVram = on;
             break;
+        case IslandPref::UsagePower:
+            g_settings.usagePower = on;
+            break;
         case IslandPref::Microphone:
             g_settings.islandMicrophone = on;
             break;
@@ -122490,6 +122854,9 @@ void SetIslandPrefValue(IslandPref pref, int value) {
             break;
         case IslandPref::UsageVram:
             g_settings.usageVram = on;
+            break;
+        case IslandPref::UsagePower:
+            g_settings.usagePower = on;
             break;
         case IslandPref::Microphone:
             g_settings.islandMicrophone = on;
@@ -124927,6 +125294,7 @@ void Island::UpdateUsageWatch() {
     bool wanted = false;
     bool gpu = false;
     bool cpuTemp = false;
+    bool power = g_settings.usagePower;
     bool fast = false;
     ForEachIsland([&](Island& island) {
         if (!island.m_hwnd) {
@@ -124955,10 +125323,13 @@ void Island::UpdateUsageWatch() {
             fast = true;
             gpu = gpu ||
                   island.m_usagePanel.GetKind() == UsagePanel::Kind::Gpu;
+            power = power ||
+                    island.m_usagePanel.GetKind() == UsagePanel::Kind::Power;
         }
     });
     g_usageGpuWanted = gpu;
     g_usageCpuTempWanted = cpuTemp;
+    g_usagePowerWanted = power;
     g_usageFast = fast;
     if (!wanted || !m_hwnd) {
         StopUsageWatch();
@@ -125068,7 +125439,20 @@ void Island::OnUsage() {
         m_usageTo[i] = values[i];
         m_usageChangedAt[i] = shown < 0 || values[i] < 0 ? 0 : now;
     }
-    if (changed) {
+    bool powerChanged = false;
+    if (g_settings.usagePower) {
+        const std::wstring text =
+            L"POW\n" + BatteryPowerText(usage.batteryPowerWatts,
+                                         usage.batteryPowerAvailable);
+        for (IslandSlot& slot : m_slots) {
+            if (slot.item == IslandItem::UsagePower &&
+                slot.font == kStackedFont && slot.text != text) {
+                slot.text = text;
+                powerChanged = true;
+            }
+        }
+    }
+    if (changed || powerChanged) {
         StartAnimating();
         Render();
     }
@@ -132276,6 +132660,18 @@ void Island::Layout() {
                              (value.empty() ? L"\u2013" : value),
                          7});
                     x += m_usageWidth + spacing;
+                }
+                if (g_settings.usagePower) {
+                    addIcon(IslandItem::UsagePower, {kGlyphPower});
+                    x -= std::round(
+                        spacing +
+                        iconSlot * (1 - kIslandIconSize / kIslandIconSlot) / 2 -
+                        2 * scale);
+                    const UsageDetails usage = GetUsage();
+                    addStacked(
+                        IslandItem::UsagePower, L"POW",
+                        BatteryPowerText(usage.batteryPowerWatts,
+                                         usage.batteryPowerAvailable));
                 }
                 break;
             }
@@ -146937,6 +147333,7 @@ bool Island::HoverPanel(IslandItem item, const std::wstring& key) {
         case IslandItem::UsageGpu:
         case IslandItem::UsageGpuTemp:
         case IslandItem::UsageCpuTemp:
+        case IslandItem::UsagePower:
         case IslandItem::NetSpeed:
             return true;
         // (Windows' own center isn't a panel of the island.)
@@ -147556,6 +147953,16 @@ void Island::OnClick(IslandItem item, const std::wstring& appId) {
             OnUsagePanelChanged();
             break;
         }
+        case IslandItem::UsagePower:
+            if (m_usagePanel.IsOpen() &&
+                m_usagePanel.GetKind() != UsagePanel::Kind::Power) {
+                m_usagePanel.SetKind(UsagePanel::Kind::Power);
+            } else {
+                m_usagePanel.SetKind(UsagePanel::Kind::Power);
+                TogglePanel(m_usagePanel, item);
+            }
+            OnUsagePanelChanged();
+            break;
         case IslandItem::TraySeparator:
         case IslandItem::None:
             break;
@@ -150232,6 +150639,7 @@ void LoadSettings() {
     g_settings.usageCpu = Wh_GetIntValue(L"usageCpu", 0) != 0;
     g_settings.usageRam = Wh_GetIntValue(L"usageRam", 0) != 0;
     g_settings.usageVram = Wh_GetIntValue(L"usageVram", 0) != 0;
+    g_settings.usagePower = Wh_GetIntValue(L"usagePower", 0) != 0;
     g_settings.islandMicrophone = Wh_GetIntValue(L"islandMicrophone", 0) != 0;
     g_settings.calendarHolidays = Wh_GetIntValue(L"calendarHolidays", 0) != 0;
     g_hidePastAfter =
